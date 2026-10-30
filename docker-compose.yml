@@ -1,0 +1,41 @@
+# ambiente local
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: "1234"
+      MYSQL_DATABASE: lojagamer
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p1234"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build:
+      context: .
+      args:
+        APP_VERSION: local
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_USER: root
+      DB_PASSWORD: "1234"
+      DB_NAME: lojagamer
+      STORAGE_DRIVER: local
+      ADMIN_TOKEN: admin123
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - images:/data/images
+
+volumes:
+  mysql-data:
+  images:

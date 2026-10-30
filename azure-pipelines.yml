@@ -1,0 +1,297 @@
+# Pipeline CI/CD - Loja Gamer (Observabilidade e Deploy AWS)
+# Compatível com as variáveis e etapas do DevLabs Escola do Dev:
+# https://devlabs.escdodev.com.br/labs/amazon-cloud-gallery-observability
+
+trigger:
+  branches:
+    include: [main]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  # =========================================================================
+  # 1. Variáveis de Infraestrutura AWS (Passo 8 do DevLabs)
+  # Preencha ou substitua pelos valores reais da sua stack AWS Academy:
+  # =========================================================================
+  awsRegion: us-east-1
+  awsBucketName: SEU_BUCKET
+  dbHost: SEU_ENDPOINT_RDS
+  dbPort: '3306'
+  dbName: lojagamer
+  dbUser: admin
+
+  # =========================================================================
+  # 2. Configurações de Imagem, Container e EC2 (Passo 5, 8 e 9 do DevLabs)
+  # =========================================================================
+  imageName: lojagamer
+  imageTag: $(Build.BuildId)
+  containerName: lojagamer
+  ec2User: ec2-user
+  sshKeySecureFile: aws-deploy-key.pem
+
+  # =========================================================================
+  # 3. Dependências e Testes (CI)
+  # =========================================================================
+  goVersion: "1.26.10"
+  nodeVersion: "24.x"
+  testMysqlDsn: "root:test@tcp(127.0.0.1:3306)/lojagamer_test?parseTime=true&multiStatements=true"
+
+# ===========================================================================
+# Observação sobre Segredos e Credenciais (Passo 9 do DevLabs):
+# Cadastre no Azure DevOps em "Pipelines > Variables":
+#   - AWS_EC2_HOST           : IPv4 público da EC2 (não secreta)
+#   - DB_PASSWORD            : Senha do RDS (secreta)
+#   - AWS_ACCESS_KEY_ID      : Credencial AWS Academy (secreta)
+#   - AWS_SECRET_ACCESS_KEY  : Credencial AWS Academy (secreta)
+#   - AWS_SESSION_TOKEN      : Credencial AWS Academy (secreta)
+#
+# Em "Pipelines > Library > Secure files":
+#   - Envie o arquivo da chave SSH: aws-deploy-key.pem
+# ===========================================================================
+
+stages:
+  # -------------------------------------------------------------------------
+  # STAGE 1: BUILD (Evidência exigida no DevLabs)
+  # -------------------------------------------------------------------------
+  - stage: Build
+    displayName: "Build · compilação e imagem Docker"
+    jobs:
+      - job: BuildJob
+        displayName: "Construir e empacotar imagem"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            displayName: "Obter código-fonte"
+
+          - script: |
+              docker build \
+                --build-arg APP_VERSION=$(Build.SourceVersion) \
+                -t $(imageName):$(imageTag) .
+              docker image ls $(imageName)
+            displayName: "Construir imagem Docker ($(imageName):$(imageTag))"
+
+          - script: |
+              set -euo pipefail
+              mkdir -p $(Build.ArtifactStagingDirectory)/release
+              docker save $(imageName):$(imageTag) | gzip > $(Build.ArtifactStagingDirectory)/release/image.tar.gz
+              cp deploy/deploy.sh $(Build.ArtifactStagingDirectory)/release/
+              ls -lh $(Build.ArtifactStagingDirectory)/release
+            displayName: "Exportar imagem e script de deploy"
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publicar artefato docker-image (release)"
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/release
+              artifact: release
+
+  # -------------------------------------------------------------------------
+  # STAGE 2: TEST (Evidência exigida no DevLabs: abas Tests e Code Coverage)
+  # -------------------------------------------------------------------------
+  - stage: Test
+    displayName: "Test · qualidade, unitários e integração"
+    dependsOn: [] # Executa em paralelo com o Build para economizar tempo
+    jobs:
+      - job: TestJob
+        displayName: "Executar testes automatizados e cobertura"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            displayName: "Obter código-fonte"
+
+          - task: GoTool@0
+            displayName: "Instalar Go $(goVersion)"
+            inputs:
+              version: $(goVersion)
+
+          - task: NodeTool@0
+            displayName: "Instalar Node $(nodeVersion)"
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: |
+              docker run -d --name mysql-test \
+                -e MYSQL_ROOT_PASSWORD=test -e MYSQL_DATABASE=lojagamer_test \
+                -p 3306:3306 mysql:8.4
+              for i in $(seq 1 60); do
+                if docker exec mysql-test mysqladmin ping -h127.0.0.1 -ptest --silent 2>/dev/null; then
+                  echo "MySQL de testes pronto"; exit 0
+                fi
+                sleep 2
+              done
+              docker logs mysql-test
+              exit 1
+            displayName: "Subir MySQL temporário para testes"
+
+          - script: |
+              set -euo pipefail
+              go install gotest.tools/gotestsum@v1.13.0
+              go install github.com/boumenot/gocover-cobertura@v1.4.0
+              echo "##vso[task.prependpath]$(go env GOPATH)/bin"
+            displayName: "Instalar ferramentas de cobertura e JUnit (Go)"
+
+          - script: |
+              set -euo pipefail
+              test -z "$(gofmt -l .)" || { echo "Arquivos sem gofmt:"; gofmt -l .; exit 1; }
+              go vet ./...
+              go build ./...
+            workingDirectory: backend
+            displayName: "Análise estática e compilação do Backend"
+
+          - script: |
+              set -euo pipefail
+              mkdir -p test-results coverage
+              gotestsum --junitfile test-results/junit.xml --format testname -- \
+                -race -count=1 -covermode=atomic -coverpkg=./internal/... -coverprofile=coverage.out ./...
+              go tool cover -func=coverage.out | tail -1
+              gocover-cobertura < coverage.out > coverage/cobertura.xml
+            workingDirectory: backend
+            displayName: "Testes unitários e de integração (Go + MySQL)"
+            env:
+              TEST_MYSQL_DSN: $(testMysqlDsn)
+
+          - script: npm ci --no-audit --no-fund
+            workingDirectory: frontend
+            displayName: "Instalar dependências (Frontend)"
+
+          - script: npm run test:ci
+            workingDirectory: frontend
+            displayName: "Testes automatizados do Frontend (Vitest)"
+
+          - script: npm run build
+            workingDirectory: frontend
+            displayName: "Build do Frontend (Vite)"
+
+          - task: PublishTestResults@2
+            displayName: "Publicar resultados dos testes (Aba Tests)"
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "**/test-results/junit.xml"
+              mergeTestResults: true
+              testRunTitle: "Testes Automatizados (Go + Vitest)"
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@2
+            displayName: "Publicar relatório de cobertura (Aba Code Coverage)"
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: "$(System.DefaultWorkingDirectory)/**/coverage/cobertura*.xml"
+
+  # -------------------------------------------------------------------------
+  # STAGE 3: DEPLOY (Evidência exigida no DevLabs: deploy na EC2 e health checks)
+  # -------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: "Deploy · publicação na AWS EC2"
+    dependsOn: [Build, Test]
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: DeployJob
+        displayName: "Publicar container na EC2"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - download: current
+            artifact: release
+            displayName: "Baixar artefato da release"
+
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: "Baixar chave SSH ($(sshKeySecureFile))"
+            inputs:
+              secureFile: $(sshKeySecureFile)
+
+          - bash: |
+              set -euo pipefail
+              umask 077
+
+              chmod 600 "$(sshKey.secureFilePath)"
+
+              TARGET_HOST="${DEPLOY_EC2_HOST:-$(AWS_EC2_HOST)}"
+              if [ -z "$TARGET_HOST" ] || [ "$TARGET_HOST" = "SEU_IP_EC2" ]; then
+                echo "##vso[task.logissue type=error]Variável AWS_EC2_HOST não informada em Pipelines > Variables."
+                exit 1
+              fi
+
+              SSH_CMD="ssh -i $(sshKey.secureFilePath) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $(ec2User)@$TARGET_HOST"
+              SCP_CMD="scp -i $(sshKey.secureFilePath) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+              echo "1. Preparando diretório de releases na EC2..."
+              $SSH_CMD "sudo mkdir -p /opt/lojagamer/releases/$(imageTag) && sudo chown -R $(ec2User):$(ec2User) /opt/lojagamer"
+
+              echo "2. Gerando arquivo /opt/lojagamer/.env com as variáveis da infraestrutura..."
+              ENV_FILE="$(Agent.TempDirectory)/.env"
+              {
+                printf 'PORT=8080\n'
+                printf 'DB_HOST=%s\n' '$(dbHost)'
+                printf 'DB_PORT=%s\n' '$(dbPort)'
+                printf 'DB_NAME=%s\n' '$(dbName)'
+                printf 'DB_USER=%s\n' '$(dbUser)'
+                printf 'DB_PASSWORD=%s\n' "$DEPLOY_DB_PASSWORD"
+                printf 'DB_TLS=preferred\n'
+                printf 'STORAGE_DRIVER=s3\n'
+                printf 'S3_BUCKET=%s\n' '$(awsBucketName)'
+                printf 'S3_PREFIX=products/\n'
+                printf 'AWS_REGION=%s\n' '$(awsRegion)'
+                printf 'AWS_ACCESS_KEY_ID=%s\n' "$DEPLOY_AWS_ACCESS_KEY_ID"
+                printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$DEPLOY_AWS_SECRET_ACCESS_KEY"
+                printf 'AWS_SESSION_TOKEN=%s\n' "$DEPLOY_AWS_SESSION_TOKEN"
+                printf 'MIGRATE=true\n'
+                printf 'LOG_LEVEL=info\n'
+                printf 'ADMIN_TOKEN=admin123\n'
+              } > "$ENV_FILE"
+
+              $SCP_CMD "$ENV_FILE" "$(ec2User)@$TARGET_HOST:/opt/lojagamer/.env"
+              $SSH_CMD "chmod 600 /opt/lojagamer/.env"
+
+              echo "3. Enviando imagem compactada e script de deploy..."
+              $SCP_CMD "$(Pipeline.Workspace)/release/image.tar.gz" "$(Pipeline.Workspace)/release/deploy.sh" "$(ec2User)@$TARGET_HOST:/opt/lojagamer/releases/$(imageTag)/"
+
+              echo "4. Executando atualização do container via deploy.sh..."
+              $SSH_CMD "bash /opt/lojagamer/releases/$(imageTag)/deploy.sh $(imageTag)"
+            displayName: "Deploy via SCP e SSH na EC2"
+            env:
+              DEPLOY_EC2_HOST: $(AWS_EC2_HOST)
+              DEPLOY_DB_PASSWORD: $(DB_PASSWORD)
+              DEPLOY_AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              DEPLOY_AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              DEPLOY_AWS_SESSION_TOKEN: $(AWS_SESSION_TOKEN)
+
+          - bash: |
+              set -uo pipefail
+              TARGET_HOST="${DEPLOY_EC2_HOST:-$(AWS_EC2_HOST)}"
+              EXPECTED="$(Build.SourceVersion)"
+
+              # Detectar porta em que a aplicação está respondendo (80 ou 8080)
+              BASE_URL="http://$TARGET_HOST"
+              if ! curl -fsS --max-time 4 "$BASE_URL/healthz" >/dev/null 2>&1; then
+                if curl -fsS --max-time 4 "http://$TARGET_HOST:8080/healthz" >/dev/null 2>&1; then
+                  BASE_URL="http://$TARGET_HOST:8080"
+                fi
+              fi
+
+              echo "Validando deploy em $BASE_URL..."
+              for i in $(seq 1 20); do
+                BODY="$(curl -fsS --max-time 5 "$BASE_URL/healthz" || true)"
+                if [ -n "$BODY" ] && echo "$BODY" | jq -e --arg v "$EXPECTED" '.status == "ok" and .version == $v' >/dev/null; then
+                  echo "$BODY" | jq .
+                  curl -fsS "$BASE_URL/api/products" | jq -e 'length > 0' >/dev/null || { echo "##vso[task.logissue type=error]API sem produtos"; exit 1; }
+                  curl -fsS -o /dev/null "$BASE_URL/" || { echo "##vso[task.logissue type=error]Frontend fora do ar"; exit 1; }
+                  echo "Deploy validado com sucesso: versão $EXPECTED ativa em $BASE_URL"
+                  exit 0
+                fi
+                echo "Tentativa $i: aguardando resposta da versão $EXPECTED... status: ${BODY:-sem resposta}"
+                sleep 5
+              done
+              echo "##vso[task.logissue type=error]A aplicação em $BASE_URL não respondeu adequadamente com a versão esperada"
+              exit 1
+            displayName: "Validar deploy (health checks e liveness)"
+            env:
+              DEPLOY_EC2_HOST: $(AWS_EC2_HOST)
